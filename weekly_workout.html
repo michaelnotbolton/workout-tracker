@@ -153,6 +153,7 @@ input,select{font-family:inherit;}
 .sync-dot{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;margin-right:5px;}
 .sync-dot.syncing{background:var(--orange);animation:pulse 1s infinite;}
 .sync-dot.error{background:var(--red);}
+.sync-dot.off{background:var(--dim);}
 @keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.3;}}
 
 /* ── Snapshot banner ── */
@@ -308,30 +309,37 @@ const GIST_FILENAME = 'workout_tracker_data.json';
 const GIST_DESCRIPTION = 'Workout Tracker Data';
 let gistId = null;
 
-function getGistToken() {
+function hasToken() { return !!localStorage.getItem('ghToken'); }
+
+// Returns a token. Only shows the prompt when interactive===true, so that
+// background auto-saves never nag you — you're asked at most once on load,
+// and otherwise only when you tap the ☁ Gist button yourself.
+function getGistToken(interactive) {
   let token = localStorage.getItem('ghToken');
-  if (!token) {
-    token = prompt(
-      'Enter a GitHub Personal Access Token with "gist" scope to enable cross-device sync.\n\n' +
-      'Create one at: github.com/settings/tokens/new (check the "gist" checkbox)\n\n' +
-      'Your token is stored only in this browser\'s localStorage and never sent anywhere except api.github.com.'
-    );
-    if (token && token.trim()) {
-      localStorage.setItem('ghToken', token.trim());
-    } else {
-      return null;
-    }
+  if (token) return token;
+  if (!interactive) return null;
+  token = prompt(
+    'Enable cross-device sync with a GitHub token.\n\n' +
+    '1. Open: github.com/settings/personal-access-tokens/new\n' +
+    '2. Pick an expiration, then under "Account permissions" set\n' +
+    '   Gists → Read and write (leave everything else as No access).\n' +
+    '3. Generate it, then paste it here.\n\n' +
+    'Stored only in this browser (localStorage); sent only to api.github.com.'
+  );
+  if (token && token.trim()) {
+    localStorage.setItem('ghToken', token.trim());
+    return token.trim();
   }
-  return token;
+  return null;
 }
 
-async function gistRequest(method, path, body) {
-  const token = getGistToken();
-  if (!token) throw new Error('No token');
+async function gistRequest(method, path, body, interactive) {
+  const token = getGistToken(interactive);
+  if (!token) { const e = new Error('No GitHub token'); e.code = 'NO_TOKEN'; throw e; }
   const resp = await fetch('https://api.github.com' + path, {
     method,
     headers: {
-      'Authorization': 'token ' + token,
+      'Authorization': 'Bearer ' + token,
       'Accept': 'application/vnd.github+json',
       'Content-Type': 'application/json',
     },
@@ -340,20 +348,23 @@ async function gistRequest(method, path, body) {
   if (!resp.ok) {
     if (resp.status === 401) {
       localStorage.removeItem('ghToken');
-      throw new Error('Bad token — cleared, please retry');
+      const e = new Error('Token invalid or expired — tap ☁ Gist to re-enter.');
+      e.code = 'BAD_TOKEN';
+      throw e;
     }
-    throw new Error('Gist API ' + resp.status);
+    throw new Error('GitHub API ' + resp.status);
   }
   return resp.json();
 }
 
-async function findOrCreateGist() {
+async function findOrCreateGist(interactive) {
   if (gistId) return gistId;
   const stored = localStorage.getItem('ghGistId');
   if (stored) { gistId = stored; return gistId; }
 
-  // Search existing gists for our file
-  const list = await gistRequest('GET', '/gists');
+  // Search existing gists for our file (per_page=100 so a busy account
+  // with many gists doesn't miss it and create a duplicate).
+  const list = await gistRequest('GET', '/gists?per_page=100', null, interactive);
   const found = list.find(g => g.files && g.files[GIST_FILENAME]);
   if (found) {
     gistId = found.id;
@@ -361,50 +372,56 @@ async function findOrCreateGist() {
     return gistId;
   }
 
-  // Create new gist
+  // None found — create one seeded with current data.
   const created = await gistRequest('POST', '/gists', {
     description: GIST_DESCRIPTION,
     public: false,
     files: { [GIST_FILENAME]: { content: JSON.stringify(data, null, 2) } }
-  });
+  }, interactive);
   gistId = created.id;
   localStorage.setItem('ghGistId', gistId);
   return gistId;
 }
 
-async function syncToDrive() {
+async function syncToDrive(interactive) {
+  // No token and not an explicit user action → stay local-only, no nagging.
+  if (!hasToken() && !interactive) { setSyncState('off'); return; }
   setSyncState('syncing');
   try {
-    const id = await findOrCreateGist();
+    const id = await findOrCreateGist(interactive);
     await gistRequest('PATCH', '/gists/' + id, {
       files: { [GIST_FILENAME]: { content: JSON.stringify(data, null, 2) } }
-    });
+    }, interactive);
     setSyncState('ok');
   } catch(e) {
+    if (e.code === 'NO_TOKEN') { setSyncState('off'); return; }
     console.error('Gist sync error:', e);
     setSyncState('error');
     showToast('Sync failed: ' + e.message);
   }
 }
 
-async function loadFromDrive() {
+async function loadFromDrive(interactive) {
+  if (!hasToken() && !interactive) { setSyncState('off'); return false; }
   setSyncState('syncing');
   try {
-    const id = await findOrCreateGist();
-    const gist = await gistRequest('GET', '/gists/' + id);
+    const id = await findOrCreateGist(interactive);
+    const gist = await gistRequest('GET', '/gists/' + id, null, interactive);
     const content = gist.files[GIST_FILENAME] && gist.files[GIST_FILENAME].content;
     if (!content) throw new Error('Empty gist');
     const remoteData = JSON.parse(content);
-    // Remote wins; merge: if same week keep remote checks
+    // Cloud is the source of truth on load (last device to save wins).
     data = remoteData;
     saveLocal();
     setSyncState('ok');
-    showToast('Loaded from Gist ☁');
+    showToast('Loaded from cloud ☁');
     render();
     return true;
   } catch(e) {
+    if (e.code === 'NO_TOKEN') { setSyncState('off'); return false; }
     console.error('Gist load error:', e);
     setSyncState('error');
+    if (e.code === 'BAD_TOKEN') showToast(e.message);
     return false;
   }
 }
@@ -412,16 +429,21 @@ async function loadFromDrive() {
 function scheduleSave() {
   saveLocal();
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => syncToDrive(), 2000);
+  syncTimer = setTimeout(() => syncToDrive(false), 2000);
 }
 
 function setSyncState(s) {
   const dot = document.getElementById('syncDot');
-  dot.className = 'sync-dot' + (s==='syncing'?' syncing':s==='error'?' error':'');
+  dot.className = 'sync-dot' + (s==='syncing'?' syncing':s==='error'?' error':s==='off'?' off':'');
+  dot.title = s==='syncing' ? 'Syncing…'
+            : s==='error'   ? 'Sync error — tap ☁ Gist to retry'
+            : s==='off'     ? 'Cloud sync off — tap ☁ Gist to enable'
+            : 'Synced to cloud';
 }
 
+// Explicit user action via the ☁ Gist button: prompts for a token if needed.
 function manualSync() {
-  syncToDrive().then(() => showToast('Gist synced ☁'));
+  syncToDrive(true).then(() => { if (hasToken()) showToast('Synced ☁'); });
 }
 
 // ═══════════════════════════════════════════
@@ -501,10 +523,16 @@ function weekProgress() {
 // TAG HELPERS
 // ═══════════════════════════════════════════
 function getTag(id) { return data.tags.find(t=>t.id===id); }
+// Escape user-entered text before it goes into innerHTML or an attribute,
+// so an exercise/tag name containing < > " ' & can't break or inject markup.
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 function tagHtml(id) {
   const t = getTag(id);
   if (!t) return '';
-  return `<span class="tag" style="background:${t.bg};color:${t.fg}">${t.label}</span>`;
+  return `<span class="tag" style="background:${escapeHtml(t.bg)};color:${escapeHtml(t.fg)}">${escapeHtml(t.label)}</span>`;
 }
 
 // ═══════════════════════════════════════════
@@ -587,7 +615,7 @@ function buildExerciseBlock(di, ii, item, isCardio) {
   const wrap = document.createElement('div');
   wrap.className = 'exercise' + (isCardio?' cardio-day':'');
   const repHint = item.reps > 0 ? `<span class="rep-hint">× ${item.reps} reps</span>` : '';
-  wrap.innerHTML = `<div class="ex-label">${item.t}${repHint}${item.tag?tagHtml(item.tag):''}</div>`;
+  wrap.innerHTML = `<div class="ex-label">${escapeHtml(item.t)}${repHint}${item.tag?tagHtml(item.tag):''}</div>`;
 
   const setsRow = document.createElement('div');
   setsRow.className = 'sets-row';
@@ -596,7 +624,7 @@ function buildExerciseBlock(di, ii, item, isCardio) {
     const checked = isChecked(di,ii,0);
     const btn = document.createElement('button');
     btn.className = 'single-btn' + (checked?' checked':'');
-    btn.innerHTML = `<span class="check-icon">${checked?'✓':'○'}</span>${item.t}`;
+    btn.innerHTML = `<span class="check-icon">${checked?'✓':'○'}</span>${escapeHtml(item.t)}`;
     btn.onclick = () => {
       toggleCheck(di,ii,0);
       btn.classList.toggle('checked');
@@ -716,7 +744,7 @@ function renderHistory(el) {
             if (week.checks[ckey(di,ii,s)]) checkedSets.push(s+1);
           }
           if (checkedSets.length > 0) {
-            checkedItems.push(`${item.t} (${checkedSets.length}/${item.sets} sets)`);
+            checkedItems.push(`${escapeHtml(item.t)} (${checkedSets.length}/${item.sets} sets)`);
           }
         });
         if (checkedItems.length === 0) return;
@@ -789,13 +817,13 @@ function buildEditBlock(di, ii, item) {
   exEl.draggable = true;
 
   const tagOptions = data.tags.map(t =>
-    `<option value="${t.id}" ${item.tag===t.id?'selected':''}>${t.label}</option>`
+    `<option value="${escapeHtml(t.id)}" ${item.tag===t.id?'selected':''}>${escapeHtml(t.label)}</option>`
   ).join('');
 
   exEl.innerHTML = `
     <div class="edit-row">
       <span class="drag-handle">⠿</span>
-      <input class="edit-name" type="text" value="${item.t}" placeholder="Exercise name" />
+      <input class="edit-name" type="text" value="${escapeHtml(item.t)}" placeholder="Exercise name" />
       <button class="del-btn" onclick="deleteExercise(${di},${ii})">✕</button>
     </div>
     <div class="edit-row">
@@ -862,7 +890,7 @@ function buildTagsEditor() {
       const item = document.createElement('div');
       item.className = 'tag-item';
       item.style.cssText = `background:${t.bg};color:${t.fg}`;
-      item.innerHTML = `${t.label}<button class="tag-del" onclick="deleteTag(${ti},this)">✕</button>`;
+      item.innerHTML = `${escapeHtml(t.label)}<button class="tag-del" onclick="deleteTag(${ti},this)">✕</button>`;
       list.appendChild(item);
     });
     wrap.appendChild(list);
@@ -932,11 +960,14 @@ async function boot() {
   todayDayIndex = getTodayScheduleIndex();
   render();
   checkNewWeek();
-  // Try loading from Drive in background
-  const loaded = await loadFromDrive();
-  if (!loaded) {
-    // First time or no Drive file — sync local up
-    syncToDrive();
+  if (hasToken()) {
+    // Already set up — pull latest from cloud silently.
+    await loadFromDrive(false);
+  } else {
+    // First run: this is the one and only automatic prompt for a token.
+    // If declined, the app stays fully usable in local-only mode.
+    await loadFromDrive(true);
+    if (!hasToken()) setSyncState('off');
   }
 }
 
