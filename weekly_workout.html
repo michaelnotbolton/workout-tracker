@@ -308,6 +308,7 @@ function loadLocal() {
 const GIST_FILENAME = 'workout_tracker_data.json';
 const GIST_DESCRIPTION = 'Workout Tracker Data';
 let gistId = null;
+let lastSyncAt = 0;
 
 function hasToken() { return !!localStorage.getItem('ghToken'); }
 
@@ -383,21 +384,71 @@ async function findOrCreateGist(interactive) {
   return gistId;
 }
 
+// Read the remote copy from the gist (null if the gist is empty/new).
+async function fetchRemote(interactive) {
+  const id = await findOrCreateGist(interactive);
+  const gist = await gistRequest('GET', '/gists/' + id, null, interactive);
+  const content = gist.files[GIST_FILENAME] && gist.files[GIST_FILENAME].content;
+  if (!content) return null;
+  try { return JSON.parse(content); } catch(e) { return null; }
+}
+
+// Conflict-free merge so you never have to think about which device you're on.
+//  • currentWeek check-offs are UNIONed (if it's checked anywhere, it stays
+//    checked) — you can't lose a workout's progress by switching devices.
+//  • schedule / tags take whichever copy was edited most recently.
+//  • history is merged by week so no saved week is ever dropped.
+function mergeData(local, remote) {
+  if (!remote) return local;
+  if (!local) return remote;
+  const lT = local.lastModified || 0, rT = remote.lastModified || 0;
+  const newer = rT >= lT ? remote : local;
+  const merged = JSON.parse(JSON.stringify(newer)); // schedule, tags, etc. from newer
+
+  // Union this week's checks when both devices are in the same week.
+  if (local.currentWeek && remote.currentWeek &&
+      local.currentWeek.weekId === remote.currentWeek.weekId) {
+    const checks = {};
+    Object.entries(local.currentWeek.checks || {}).forEach(([k,v]) => { if (v) checks[k] = true; });
+    Object.entries(remote.currentWeek.checks || {}).forEach(([k,v]) => { if (v) checks[k] = true; });
+    merged.currentWeek = { weekId: local.currentWeek.weekId, checks };
+  }
+
+  // Merge history by weekId (keep every snapshot from either device).
+  const byWeek = {};
+  [].concat(local.history || [], remote.history || []).forEach(w => {
+    if (w && w.weekId && !byWeek[w.weekId]) byWeek[w.weekId] = w;
+  });
+  merged.history = Object.values(byWeek).sort((a,b) => b.weekId.localeCompare(a.weekId));
+  merged.lastModified = Math.max(lT, rT);
+  return merged;
+}
+
 async function syncToDrive(interactive) {
   // No token and not an explicit user action → stay local-only, no nagging.
   if (!hasToken() && !interactive) { setSyncState('off'); return; }
   setSyncState('syncing');
   try {
     const id = await findOrCreateGist(interactive);
+    // Pull-merge-push: fold in anything another device saved, so we never
+    // clobber the cloud copy.
+    const remote = await fetchRemote(interactive);
+    const before = JSON.stringify(data.currentWeek && data.currentWeek.checks);
+    data = mergeData(data, remote);
+    if (JSON.stringify(data.currentWeek && data.currentWeek.checks) !== before) {
+      saveLocal(); render(); // remote had checks we didn't — reflect them
+    }
     await gistRequest('PATCH', '/gists/' + id, {
       files: { [GIST_FILENAME]: { content: JSON.stringify(data, null, 2) } }
     }, interactive);
+    lastSyncAt = Date.now();
     setSyncState('ok');
   } catch(e) {
     if (e.code === 'NO_TOKEN') { setSyncState('off'); return; }
     console.error('Gist sync error:', e);
     setSyncState('error');
-    showToast('Sync failed: ' + e.message);
+    if (e.code === 'BAD_TOKEN') showToast(e.message);
+    else showToast('Sync failed: ' + e.message);
   }
 }
 
@@ -405,17 +456,13 @@ async function loadFromDrive(interactive) {
   if (!hasToken() && !interactive) { setSyncState('off'); return false; }
   setSyncState('syncing');
   try {
-    const id = await findOrCreateGist(interactive);
-    const gist = await gistRequest('GET', '/gists/' + id, null, interactive);
-    const content = gist.files[GIST_FILENAME] && gist.files[GIST_FILENAME].content;
-    if (!content) throw new Error('Empty gist');
-    const remoteData = JSON.parse(content);
-    // Cloud is the source of truth on load (last device to save wins).
-    data = remoteData;
+    const remote = await fetchRemote(interactive);
+    const before = JSON.stringify(data);
+    data = mergeData(data, remote);
     saveLocal();
+    lastSyncAt = Date.now();
     setSyncState('ok');
-    showToast('Loaded from cloud ☁');
-    render();
+    if (JSON.stringify(data) !== before) { render(); }
     return true;
   } catch(e) {
     if (e.code === 'NO_TOKEN') { setSyncState('off'); return false; }
@@ -427,9 +474,19 @@ async function loadFromDrive(interactive) {
 }
 
 function scheduleSave() {
+  data.lastModified = Date.now(); // stamp every change so merges pick the newest
   saveLocal();
   clearTimeout(syncTimer);
   syncTimer = setTimeout(() => syncToDrive(false), 2000);
+}
+
+// Pick up changes made on other devices when you return to this tab,
+// so a tab left open doesn't show stale data. Throttled to avoid churn.
+function maybeRefreshFromCloud() {
+  if (document.visibilityState !== 'visible') return;
+  if (!hasToken()) return;
+  if (Date.now() - lastSyncAt < 8000) return;
+  loadFromDrive(false);
 }
 
 function setSyncState(s) {
@@ -970,6 +1027,11 @@ async function boot() {
     if (!hasToken()) setSyncState('off');
   }
 }
+
+// When you come back to the app (refocus tab, unlock phone, reopen PWA),
+// quietly pull anything other devices saved.
+document.addEventListener('visibilitychange', maybeRefreshFromCloud);
+window.addEventListener('focus', maybeRefreshFromCloud);
 
 boot();
 </script>
